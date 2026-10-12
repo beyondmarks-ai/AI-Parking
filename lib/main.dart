@@ -1,10 +1,25 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
+import 'camera_discovery.dart';
+import 'camera_wifi_config.dart';
+import 'live_camera_stream.dart';
+import 'motion_trigger.dart';
+import 'plate_ocr.dart';
+import 'image_parking_analyzer.dart';
+import 'image_scan_policy.dart';
+import 'snapshot_archive.dart';
+import 'parking_zone.dart';
+import 'parking_zone_editor.dart';
 
 void main() => runApp(const ParkGuardApp());
 
 class ParkGuardApp extends StatelessWidget {
-  const ParkGuardApp({super.key});
+  const ParkGuardApp({super.key, this.autoDiscoverCamera = true});
+
+  final bool autoDiscoverCamera;
 
   @override
   Widget build(BuildContext context) => MaterialApp(
@@ -19,12 +34,14 @@ class ParkGuardApp extends StatelessWidget {
         brightness: Brightness.light,
       ),
     ),
-    home: const OperatorHome(),
+    home: OperatorHome(autoDiscoverCamera: autoDiscoverCamera),
   );
 }
 
 class OperatorHome extends StatefulWidget {
-  const OperatorHome({super.key});
+  const OperatorHome({super.key, this.autoDiscoverCamera = true});
+
+  final bool autoDiscoverCamera;
   @override
   State<OperatorHome> createState() => _OperatorHomeState();
 }
@@ -35,10 +52,110 @@ class _OperatorHomeState extends State<OperatorHome> {
   String? _videoName;
   bool _analysing = false;
   bool _hasResult = false;
+  bool _discoveringCamera = false;
+  bool _updatingCameraWifi = false;
+  String? _liveStreamUrl;
+  int _cameraConnectionId = 0;
+  CameraFrame? _latestCameraFrame;
+  PlateOcrResult? _plateOcrResult;
+  bool _readingPlate = false;
+  String _scanStatus = 'Live — watching for movement';
+  bool _autoScanning = true;
+  var _scanPolicy = ImageScanPolicy();
+  String _lcdStatus = 'Waiting for a confirmed number';
+  final _snapshotArchive = SnapshotArchive();
+  PlateSnapshot? _archiveSnapshot;
+  String? _archiveKey;
+  DateTime? _archiveAttemptAt;
+  bool _archiveBusy = false;
+  bool _archiveSaved = false;
+  String _archiveStatus = 'No snapshot saved yet';
+  final List<CameraFrame> _burstFrames = [];
+  DateTime? _burstStartsAt;
+  int _scanGeneration = 0;
+  final _motionTrigger = MotionTrigger(cooldown: Duration.zero);
+  ImageParkingAnalyzer? _activeRecognizer;
   final _rtspController = TextEditingController();
+  final _zoneStore = ParkingZoneStore();
+  ParkingZone? _parkingZone;
+  bool _editingZone = false;
+  int _zoneLoadId = 0;
+
+  Future<void> _loadParkingZone(String camera) async {
+    final id = ++_zoneLoadId;
+    setState(() {
+      _parkingZone = null;
+      _scanStatus = 'Mark the no-parking bay to enable scanning';
+    });
+    final zone = await _zoneStore.load(camera);
+    if (!mounted || id != _zoneLoadId || camera != _liveStreamUrl) return;
+    setState(() {
+      _parkingZone = zone;
+      if (zone != null) {
+        _scanStatus = 'Bay loaded - image analysis ready';
+      }
+    });
+  }
+
+  Future<void> _markParkingZone() async {
+    final frame = _latestCameraFrame;
+    final camera = _liveStreamUrl;
+    if (_editingZone || frame == null || !frame.isFresh || camera == null) {
+      return;
+    }
+    final aspect = jpegAspectRatio(frame.jpeg);
+    if (aspect == null) return;
+    _zoneLoadId++;
+    _cancelPlateScan();
+    setState(() => _editingZone = true);
+    final zone = await Navigator.of(context).push<ParkingZone>(
+      MaterialPageRoute(
+        builder: (_) => ParkingZoneEditor(jpeg: frame.jpeg, aspect: aspect),
+      ),
+    );
+    if (!mounted) return;
+    try {
+      if (zone != null && camera == _liveStreamUrl) {
+        await _zoneStore.save(camera, zone);
+        if (!mounted || camera != _liveStreamUrl) return;
+        setState(() {
+          _parkingZone = zone;
+          // A new calibration starts a new archive/alert encounter.
+          _scanPolicy = ImageScanPolicy();
+          _archiveKey = null;
+        });
+        _showMessage('Whole bay saved. No red strips needed.');
+      }
+    } on Object {
+      if (mounted) _showMessage('Could not save the bay. Please try again.');
+    } finally {
+      if (mounted) {
+        _motionTrigger.reset();
+        setState(() {
+          _editingZone = false;
+          _scanStatus = _parkingZone == null
+              ? 'Mark the no-parking bay to enable scanning'
+              : 'Image checks on movement and every 30 seconds';
+        });
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.autoDiscoverCamera) {
+      WidgetsBinding.instance.addPostFrameCallback(
+        (_) => _discoverCamera(true),
+      );
+    }
+  }
 
   @override
   void dispose() {
+    _snapshotArchive.close();
+    _activeRecognizer?.close();
+    _scanGeneration++;
     _rtspController.dispose();
     super.dispose();
   }
@@ -78,20 +195,373 @@ class _OperatorHomeState extends State<OperatorHome> {
     setState(() {
       _analysing = false;
       _hasResult = true;
-      _tab = 1;
+      if (_liveStreamUrl == null) _tab = 1;
     });
   }
 
-  void _testRtsp() {
-    final value = _rtspController.text.trim();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          value.startsWith('rtsp://') || value.startsWith('rtsps://')
-              ? 'RTSP URL saved. Connect the video worker to test the live feed.'
-              : 'Enter a valid RTSP URL beginning with rtsp:// or rtsps://',
-        ),
-      ),
+  void _connectCamera() {
+    var value = _rtspController.text.trim();
+    if (value.isEmpty) {
+      _showMessage('Enter the ESP32-CAM IP address or stream URL.');
+      return;
+    }
+    if (!value.contains('://')) value = 'http://$value';
+
+    final uri = Uri.tryParse(value);
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty) {
+      _showMessage('Use an HTTP URL such as http://192.168.1.50:81/stream');
+      return;
+    }
+
+    // CameraWebServer uses port 80 for controls and port 81 for MJPEG.
+    if ((uri.path.isEmpty || uri.path == '/') && !uri.hasPort) {
+      value = uri.replace(port: 81, path: '/stream').toString();
+    } else if (uri.path.isEmpty || uri.path == '/') {
+      value = uri.replace(path: '/stream').toString();
+    }
+
+    _rtspController.text = value;
+    _cancelPlateScan();
+    _motionTrigger.reset();
+    setState(() {
+      _latestCameraFrame = null;
+      _liveStreamUrl = value;
+      _cameraConnectionId++;
+      _tab = 2;
+    });
+    _showMessage('Connecting to ESP32-CAM on $value');
+    unawaited(_loadParkingZone(value));
+  }
+
+  void _disconnectCamera() {
+    _cancelPlateScan();
+    _motionTrigger.reset();
+    setState(() {
+      _liveStreamUrl = null;
+      _latestCameraFrame = null;
+      _parkingZone = null;
+      _zoneLoadId++;
+    });
+  }
+
+  void _rememberCameraFrame(List<int> bytes) {
+    if (!mounted || _liveStreamUrl == null) return;
+    if (bytes.isEmpty) {
+      _cancelPlateScan();
+      _motionTrigger.reset();
+      if (_latestCameraFrame != null) setState(() => _latestCameraFrame = null);
+      return;
+    }
+    final firstFrame = _latestCameraFrame == null;
+    final frame = CameraFrame(bytes);
+    _latestCameraFrame = frame;
+    final startsAt = _burstStartsAt;
+    if (startsAt != null &&
+        !frame.capturedAt.isBefore(startsAt) &&
+        (_burstFrames.isEmpty ||
+            frame.capturedAt.difference(_burstFrames.last.capturedAt) >=
+                const Duration(milliseconds: 150))) {
+      if (_burstFrames.length < 8) _burstFrames.add(frame);
+    }
+    if (firstFrame) setState(() {});
+
+    final zone = _parkingZone;
+    if (zone == null || _editingZone) return;
+    final aspect = jpegAspectRatio(frame.jpeg);
+    if (aspect == null) return;
+    if (!zone.matchesAspect(aspect)) {
+      _cancelPlateScan();
+      _motionTrigger.reset();
+      setState(() {
+        _parkingZone = null;
+        _scanStatus = 'Camera image changed - mark the bay again';
+      });
+      return;
+    }
+    if (!_autoScanning) return;
+    final motion = _motionTrigger.addFrame(bytes, capturedAt: frame.capturedAt);
+    _scanPolicy.frame(frame.capturedAt, motion: motion);
+    if (!_readingPlate && _scanPolicy.shouldScan(frame.capturedAt)) {
+      unawaited(_readVehicleNumber(automatic: true));
+    }
+  }
+
+  void _cancelPlateScan() {
+    _scanGeneration++;
+    _activeRecognizer?.close();
+    _activeRecognizer = null;
+    _scanPolicy.suspend();
+    _burstStartsAt = null;
+    _burstFrames.clear();
+    _readingPlate = false;
+  }
+
+  Future<void> _readVehicleNumber({bool automatic = false}) async {
+    if (_readingPlate) return;
+    final zone = _parkingZone;
+    if (zone == null || _editingZone) {
+      if (!automatic) _showMessage('Mark the no-parking bay first.');
+      return;
+    }
+    final frame = _latestCameraFrame;
+    if (_liveStreamUrl == null || frame == null || !frame.isFresh) {
+      _showMessage('Wait for a live camera image, then try again.');
+      return;
+    }
+    final generation = _scanGeneration;
+    if (!_scanPolicy.start(DateTime.now())) {
+      if (!automatic) {
+        _showMessage(
+          'Image analyzer is cooling down briefly. Automatic checks continue.',
+        );
+      }
+      return;
+    }
+    final streamUrl = _liveStreamUrl!;
+    bool active() =>
+        mounted && generation == _scanGeneration && _liveStreamUrl == streamUrl;
+    setState(() {
+      _readingPlate = true;
+      _scanStatus = 'Capturing in background — live video continues';
+    });
+    final recognizer = ImageParkingAnalyzer();
+    _activeRecognizer = recognizer;
+    var failed = false;
+    try {
+      _burstFrames.clear();
+      _burstStartsAt = DateTime.now();
+      await Future<void>.delayed(const Duration(milliseconds: 650));
+      if (!active()) return;
+      _burstStartsAt = null;
+      final burst = _burstFrames.isEmpty
+          ? [frame]
+          : List<CameraFrame>.from(_burstFrames);
+      setState(
+        () => _scanStatus = 'Analyzing image: vehicle, plate and bay position',
+      );
+      final observation = await recognizer.analyze(
+        burst,
+        zone: zone,
+        isActive: active,
+      );
+      if (!active()) return;
+      final result = observation.result;
+      if (result == null) {
+        if (observation.status == 'empty') _scanPolicy.observeEmpty();
+        setState(
+          () => _scanStatus = observation.status == 'empty'
+              ? 'No vehicle visible - image checks continue automatically'
+              : 'Image unclear: plate or bay position uncertain - retrying automatically',
+        );
+        return;
+      }
+      final candidates = result.candidates;
+      String? lcdError;
+      final plate = candidates.isEmpty ? null : candidates.first;
+      if (plate != null) _saveSnapshotInBackground(result);
+      final decisionKey =
+          '$plate:${result.parkingPosition}:${result.fineAmount}';
+      final decisionText = result.noParkingViolation
+          ? 'FINE Rs ${result.fineAmount}'
+          : 'NO FINE';
+      final isRepeatedAlert =
+          plate != null && !_scanPolicy.shouldRelay(decisionKey);
+      setState(() => _plateOcrResult = result);
+      if (isRepeatedAlert) {
+        setState(
+          () => _scanStatus =
+              '$plate - $decisionText - live image checks continue',
+        );
+        return;
+      }
+      setState(() {
+        _plateOcrResult = result;
+        _scanStatus = '$plate - $decisionText - camera stays live';
+        _lcdStatus = 'Sending number to LCD relay...';
+      });
+      if (_liveStreamUrl != null && plate != null && !isRepeatedAlert) {
+        try {
+          await sendParkingResultToCamera(
+            streamUrl: streamUrl,
+            plate: plate,
+            fineAmount: result.fineAmount,
+          );
+          if (!active()) return;
+          _scanPolicy.acknowledge(decisionKey);
+        } on Object catch (error) {
+          lcdError = '$error';
+        }
+      }
+      if (!active()) return;
+      setState(() {
+        _lcdStatus = lcdError == null
+            ? 'LCD relay accepted $plate / $decisionText (screen receipt unverified)'
+            : 'LCD relay failed — retrying automatically';
+      });
+      if (lcdError != null) {
+        _showMessage('Number detected, but LCD update failed: $lcdError');
+      } else if (automatic && plate != null && !isRepeatedAlert) {
+        _showMessage(
+          result.noParkingViolation
+              ? '$plate: inside bay - Fine Rs ${result.fineAmount}'
+              : '$plate: outside bay - NO FINE',
+        );
+      }
+      // This is the user's display-only demo rule, not a legal fine notice.
+    } on Object catch (error) {
+      failed = true;
+      if (active()) {
+        setState(
+          () => _scanStatus =
+              'Image analyzer unavailable - retrying in 30 seconds',
+        );
+        if (!automatic) _showMessage('Could not confirm the number: $error');
+      }
+    } finally {
+      recognizer.close();
+      if (active()) {
+        _activeRecognizer = null;
+        _scanPolicy.completed(DateTime.now(), failed: failed);
+        setState(() => _readingPlate = false);
+      }
+    }
+  }
+
+  Future<void> _discoverCamera([bool silent = false]) async {
+    if (_discoveringCamera) return;
+    _cancelPlateScan();
+    _motionTrigger.reset();
+    setState(() {
+      _discoveringCamera = true;
+      // Release the ESP32's active stream before probing its capture endpoint.
+      // Some firmware cannot serve captures reliably while video is running.
+      _liveStreamUrl = null;
+      _latestCameraFrame = null;
+    });
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted) return;
+    final streamUrl = await discoverParkGuardCamera();
+    if (!mounted) return;
+    setState(() {
+      _discoveringCamera = false;
+      if (streamUrl != null) {
+        // A failed MJPEG connection does not retry by itself. Recreate the
+        // camera page even when discovery returns the same URL after recovery.
+        _cameraConnectionId++;
+        _latestCameraFrame = null;
+        _rtspController.text = streamUrl;
+        _liveStreamUrl = streamUrl;
+        _tab = 2;
+      }
+    });
+    if (streamUrl != null) {
+      unawaited(_loadParkingZone(streamUrl));
+      _showMessage('ESP32-CAM found. Starting live video.');
+    } else if (!silent) {
+      _showMessage(
+        'No ParkGuard camera found. Check Wi-Fi and the ESP32 mDNS setup.',
+      );
+    }
+  }
+
+  Future<void> _configureCameraWifi() async {
+    final streamUrl = _liveStreamUrl;
+    if (streamUrl == null) {
+      _showMessage('Connect to the ESP32-CAM before changing its Wi-Fi.');
+      return;
+    }
+    final credentials = await showDialog<_WifiCredentials>(
+      context: context,
+      builder: (_) => const _WifiCredentialsDialog(),
+    );
+    if (credentials == null || !mounted) return;
+
+    setState(() => _updatingCameraWifi = true);
+    try {
+      await updateCameraWifi(
+        streamUrl: streamUrl,
+        ssid: credentials.ssid,
+        password: credentials.password,
+      );
+      if (!mounted) return;
+      _cancelPlateScan();
+      setState(() {
+        _updatingCameraWifi = false;
+        _liveStreamUrl = null;
+        _rtspController.clear();
+      });
+      _showMessage(
+        'Wi-Fi saved. The camera is restarting. Connect this phone to the new network, then tap Find automatically.',
+      );
+    } on Object catch (error) {
+      if (!mounted) return;
+      setState(() => _updatingCameraWifi = false);
+      _showMessage('Could not update camera Wi-Fi: $error');
+    }
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  void _toggleAutoScanning(bool enabled) {
+    _cancelPlateScan();
+    _motionTrigger.reset();
+    setState(() {
+      _autoScanning = enabled;
+      _scanStatus = enabled
+          ? (_parkingZone == null
+                ? 'Mark the no-parking bay to enable scanning'
+                : 'Image checks on movement and every 30 seconds')
+          : 'Automatic scanning paused';
+    });
+  }
+
+  void _saveSnapshotInBackground(PlateOcrResult result) {
+    final key =
+        '$_cameraConnectionId:${_scanPolicy.encounter}:${result.candidates.single}:${result.parkingPosition}:${result.fineAmount}';
+    if (_archiveKey != key) {
+      _archiveKey = key;
+      _archiveSnapshot = PlateSnapshot(result);
+      _archiveBusy = false;
+      _archiveSaved = false;
+      _archiveAttemptAt = null;
+    }
+    if (_archiveBusy ||
+        _archiveSaved ||
+        (_archiveAttemptAt != null &&
+            DateTime.now().difference(_archiveAttemptAt!).inSeconds < 30)) {
+      return;
+    }
+    final snapshot = _archiveSnapshot!;
+    _archiveAttemptAt = DateTime.now();
+    _archiveBusy = true;
+    setState(
+      () => _archiveStatus = 'Saving snapshot + ${snapshot.plate} to Azure...',
+    );
+    unawaited(
+      _snapshotArchive
+          .save(snapshot)
+          .then((_) {
+            if (!mounted || !identical(_archiveSnapshot, snapshot)) return;
+            setState(() {
+              _archiveBusy = false;
+              _archiveSaved = true;
+              _archiveStatus =
+                  'Snapshot + ${snapshot.plate} saved privately in Azure';
+            });
+          })
+          .catchError((Object error) {
+            if (!mounted || !identical(_archiveSnapshot, snapshot)) return;
+            setState(() {
+              _archiveBusy = false;
+              _archiveStatus =
+                  'Snapshot not saved — will retry on next confirmation';
+            });
+          }),
     );
   }
 
@@ -100,18 +570,66 @@ class _OperatorHomeState extends State<OperatorHome> {
     final isWide = MediaQuery.sizeOf(context).width >= 860;
     final pages = [
       _WorkSpace(
+        key: ValueKey('workspace-$_cameraConnectionId'),
+        onOpenCamera: () => setState(() => _tab = 2),
         videoName: _videoName,
         analysing: _analysing,
         onPick: _chooseVideo,
         onAnalyse: _analyse,
         rtspController: _rtspController,
-        onTestRtsp: _testRtsp,
+        liveStreamUrl: _liveStreamUrl,
+        discoveringCamera: _discoveringCamera,
+        onConnectCamera: _connectCamera,
+        onDisconnectCamera: _disconnectCamera,
+        onDiscoverCamera: _discoverCamera,
+        updatingCameraWifi: _updatingCameraWifi,
+        onConfigureCameraWifi: _configureCameraWifi,
+        onFrame: _rememberCameraFrame,
       ),
-      _ResultsPage(showResult: _hasResult),
-      _CamerasPage(controller: _rtspController, onTest: _testRtsp),
+      _ResultsPage(
+        showResult: _hasResult,
+        ocrResult: _plateOcrResult,
+        onRetryOcr: () => setState(() => _tab = 2),
+      ),
+      _CamerasPage(
+        key: ValueKey('camera-$_cameraConnectionId'),
+        zone: _parkingZone,
+        onMarkZone: _markParkingZone,
+        autoScanning: _autoScanning,
+        onAutoScanningChanged: _toggleAutoScanning,
+        lastPlate: _plateOcrResult?.candidates.firstOrNull,
+        lcdStatus: _lcdStatus,
+        archiveStatus: _archiveStatus,
+        onFrame: _rememberCameraFrame,
+        cameraReady: _latestCameraFrame != null,
+        readingPlate: _readingPlate,
+        scanStatus: _scanStatus,
+        onReadPlate: () => _readVehicleNumber(),
+        controller: _rtspController,
+        streamUrl: _liveStreamUrl,
+        discovering: _discoveringCamera,
+        onConnect: _connectCamera,
+        onDisconnect: _disconnectCamera,
+        onDiscover: _discoverCamera,
+        updatingWifi: _updatingCameraWifi,
+        onConfigureWifi: _configureCameraWifi,
+      ),
     ];
     return Scaffold(
       appBar: AppBar(
+        bottom: _liveStreamUrl == null
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(42),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: Text(
+                    _scanStatus,
+                    maxLines: 2,
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
         backgroundColor: Colors.white,
         surfaceTintColor: Colors.white,
         elevation: 0,
@@ -119,23 +637,31 @@ class _OperatorHomeState extends State<OperatorHome> {
           children: [
             _LogoMark(),
             SizedBox(width: 10),
-            Text(
-              'ParkGuard',
-              style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: -.4),
-            ),
-            Text(
-              ' AI',
-              style: TextStyle(
-                color: Color(0xFF2155D9),
-                fontWeight: FontWeight.w800,
+            Expanded(
+              child: Text.rich(
+                TextSpan(
+                  text: 'ParkGuard',
+                  children: [
+                    TextSpan(
+                      text: ' AI',
+                      style: TextStyle(color: Color(0xFF2155D9)),
+                    ),
+                  ],
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -.4,
+                ),
               ),
             ),
           ],
         ),
-        actions: const [
-          _OnlineBadge(),
-          SizedBox(width: 16),
-          CircleAvatar(
+        actions: [
+          _OnlineBadge(compact: MediaQuery.sizeOf(context).width < 420),
+          const SizedBox(width: 12),
+          const CircleAvatar(
             radius: 17,
             backgroundColor: Color(0xFFE8EEFF),
             child: Text(
@@ -146,7 +672,7 @@ class _OperatorHomeState extends State<OperatorHome> {
               ),
             ),
           ),
-          SizedBox(width: 20),
+          const SizedBox(width: 16),
         ],
       ),
       body: isWide
@@ -156,10 +682,12 @@ class _OperatorHomeState extends State<OperatorHome> {
                   selected: _tab,
                   onSelected: (value) => setState(() => _tab = value),
                 ),
-                Expanded(child: pages[_tab]),
+                Expanded(
+                  child: IndexedStack(index: _tab, children: pages),
+                ),
               ],
             )
-          : pages[_tab],
+          : IndexedStack(index: _tab, children: pages),
       bottomNavigationBar: isWide
           ? null
           : NavigationBar(
@@ -189,19 +717,36 @@ class _OperatorHomeState extends State<OperatorHome> {
 
 class _WorkSpace extends StatelessWidget {
   const _WorkSpace({
+    super.key,
     required this.videoName,
     required this.analysing,
     required this.onPick,
     required this.onAnalyse,
     required this.rtspController,
-    required this.onTestRtsp,
+    required this.liveStreamUrl,
+    required this.discoveringCamera,
+    required this.onConnectCamera,
+    required this.onDisconnectCamera,
+    required this.onDiscoverCamera,
+    required this.updatingCameraWifi,
+    required this.onConfigureCameraWifi,
+    required this.onFrame,
+    required this.onOpenCamera,
   });
   final String? videoName;
   final bool analysing;
   final VoidCallback onPick;
   final VoidCallback onAnalyse;
   final TextEditingController rtspController;
-  final VoidCallback onTestRtsp;
+  final String? liveStreamUrl;
+  final bool discoveringCamera;
+  final VoidCallback onConnectCamera;
+  final VoidCallback onDisconnectCamera;
+  final VoidCallback onDiscoverCamera;
+  final bool updatingCameraWifi;
+  final VoidCallback onConfigureCameraWifi;
+  final ValueChanged<List<int>> onFrame;
+  final VoidCallback onOpenCamera;
 
   @override
   Widget build(BuildContext context) => _Page(
@@ -236,8 +781,16 @@ class _WorkSpace extends StatelessWidget {
                     const SizedBox(width: 18),
                     Expanded(
                       child: _RtspCard(
+                        onOpenCamera: onOpenCamera,
+                        onFrame: onFrame,
                         controller: rtspController,
-                        onTest: onTestRtsp,
+                        streamUrl: liveStreamUrl,
+                        discovering: discoveringCamera,
+                        onConnect: onConnectCamera,
+                        onDisconnect: onDisconnectCamera,
+                        onDiscover: onDiscoverCamera,
+                        updatingWifi: updatingCameraWifi,
+                        onConfigureWifi: onConfigureCameraWifi,
                       ),
                     ),
                   ],
@@ -251,7 +804,18 @@ class _WorkSpace extends StatelessWidget {
                       onAnalyse: onAnalyse,
                     ),
                     const SizedBox(height: 18),
-                    _RtspCard(controller: rtspController, onTest: onTestRtsp),
+                    _RtspCard(
+                      onOpenCamera: onOpenCamera,
+                      onFrame: onFrame,
+                      controller: rtspController,
+                      streamUrl: liveStreamUrl,
+                      discovering: discoveringCamera,
+                      onConnect: onConnectCamera,
+                      onDisconnect: onDisconnectCamera,
+                      onDiscover: onDiscoverCamera,
+                      updatingWifi: updatingCameraWifi,
+                      onConfigureWifi: onConfigureCameraWifi,
+                    ),
                   ],
                 ),
         ),
@@ -327,7 +891,8 @@ class _UploadCard extends StatelessWidget {
           onTap: analysing ? null : onPick,
           borderRadius: BorderRadius.circular(14),
           child: Container(
-            height: 170,
+            constraints: const BoxConstraints(minHeight: 170),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 16),
             width: double.infinity,
             decoration: BoxDecoration(
               color: const Color(0xFFF6F8FF),
@@ -336,6 +901,7 @@ class _UploadCard extends StatelessWidget {
             ),
             child: videoName == null
                 ? const Column(
+                    mainAxisSize: MainAxisSize.min,
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       CircleAvatar(
@@ -350,11 +916,13 @@ class _UploadCard extends StatelessWidget {
                       SizedBox(height: 12),
                       Text(
                         'Tap to select parking footage',
+                        textAlign: TextAlign.center,
                         style: TextStyle(fontWeight: FontWeight.w700),
                       ),
                       SizedBox(height: 4),
                       Text(
                         'Your file stays in your secure evidence storage',
+                        textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 12,
                           color: Color(0xFF64748B),
@@ -363,6 +931,7 @@ class _UploadCard extends StatelessWidget {
                     ],
                   )
                 : Column(
+                    mainAxisSize: MainAxisSize.min,
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       const CircleAvatar(
@@ -421,9 +990,30 @@ class _UploadCard extends StatelessWidget {
 }
 
 class _RtspCard extends StatelessWidget {
-  const _RtspCard({required this.controller, required this.onTest});
+  const _RtspCard({
+    required this.controller,
+    required this.streamUrl,
+    required this.discovering,
+    required this.onConnect,
+    required this.onDisconnect,
+    required this.onDiscover,
+    required this.updatingWifi,
+    required this.onConfigureWifi,
+    this.onFrame,
+    this.onOpenCamera,
+    this.zone,
+  });
   final TextEditingController controller;
-  final VoidCallback onTest;
+  final String? streamUrl;
+  final bool discovering;
+  final VoidCallback onConnect;
+  final VoidCallback onDisconnect;
+  final VoidCallback onDiscover;
+  final bool updatingWifi;
+  final VoidCallback onConfigureWifi;
+  final ValueChanged<List<int>>? onFrame;
+  final VoidCallback? onOpenCamera;
+  final ParkingZone? zone;
   @override
   Widget build(BuildContext context) => _Panel(
     child: Column(
@@ -431,28 +1021,91 @@ class _RtspCard extends StatelessWidget {
       children: [
         const _PanelTitle(
           icon: Icons.sensors_outlined,
-          title: 'Live RTSP camera',
-          subtitle: 'Connect an IP camera or NVR stream',
+          title: 'Live ESP32-CAM',
+          subtitle: 'Play the camera\'s HTTP MJPEG stream',
         ),
-        const SizedBox(height: 25),
+        const SizedBox(height: 18),
+        if (onOpenCamera != null) ...[
+          OutlinedButton.icon(
+            onPressed: onOpenCamera,
+            icon: const Icon(Icons.videocam),
+            label: Text(
+              streamUrl == null
+                  ? 'Open automatic scanner'
+                  : 'View live automatic scanner',
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+        if (streamUrl != null && onOpenCamera == null) ...[
+          ClipRRect(
+            borderRadius: BorderRadius.circular(14),
+            child: AspectRatio(
+              aspectRatio: 4 / 3,
+              child: ColoredBox(
+                color: Colors.black,
+                child: _LiveCameraView(
+                  key: ValueKey(streamUrl),
+                  streamUrl: streamUrl!,
+                  onFrame: onFrame,
+                  zone: zone,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
         TextField(
           controller: controller,
           keyboardType: TextInputType.url,
+          onSubmitted: (_) => onConnect(),
           decoration: const InputDecoration(
-            labelText: 'RTSP stream URL',
-            hintText: 'rtsp://user:password@camera-ip:554/stream',
+            labelText: 'ESP32-CAM address',
+            hintText: '192.168.1.50 or http://192.168.1.50:81/stream',
             prefixIcon: Icon(Icons.link),
             border: OutlineInputBorder(),
           ),
         ),
         const SizedBox(height: 13),
-        OutlinedButton.icon(
-          onPressed: onTest,
-          style: OutlinedButton.styleFrom(
-            minimumSize: const Size.fromHeight(48),
+        FilledButton.icon(
+          onPressed: streamUrl == null ? onConnect : onDisconnect,
+          style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+          icon: Icon(streamUrl == null ? Icons.play_arrow : Icons.stop),
+          label: Text(
+            streamUrl == null ? 'Start live video' : 'Stop live video',
           ),
-          icon: const Icon(Icons.network_ping_outlined),
-          label: const Text('Test camera connection'),
+        ),
+        const SizedBox(height: 9),
+        OutlinedButton.icon(
+          onPressed: discovering ? null : onDiscover,
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size.fromHeight(44),
+          ),
+          icon: discovering
+              ? const SizedBox.square(
+                  dimension: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.wifi_find),
+          label: Text(
+            discovering ? 'Searching nearby cameras...' : 'Find automatically',
+          ),
+        ),
+        const SizedBox(height: 9),
+        OutlinedButton.icon(
+          onPressed: streamUrl == null || updatingWifi ? null : onConfigureWifi,
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size.fromHeight(44),
+          ),
+          icon: updatingWifi
+              ? const SizedBox.square(
+                  dimension: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.wifi_password_outlined),
+          label: Text(
+            updatingWifi ? 'Saving Wi-Fi settings...' : 'Change camera Wi-Fi',
+          ),
         ),
         const SizedBox(height: 20),
         const Divider(),
@@ -463,7 +1116,7 @@ class _RtspCard extends StatelessWidget {
             SizedBox(width: 8),
             Expanded(
               child: Text(
-                'RTSP credentials are stored securely and are never shown in reports.',
+                'The phone and ESP32-CAM must be on the same Wi-Fi network. Image analysis runs in Azure; keep this app open.',
                 style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
               ),
             ),
@@ -475,8 +1128,14 @@ class _RtspCard extends StatelessWidget {
 }
 
 class _ResultsPage extends StatelessWidget {
-  const _ResultsPage({required this.showResult});
+  const _ResultsPage({
+    required this.showResult,
+    this.ocrResult,
+    this.onRetryOcr,
+  });
   final bool showResult;
+  final PlateOcrResult? ocrResult;
+  final VoidCallback? onRetryOcr;
   @override
   Widget build(BuildContext context) => _Page(
     child: ListView(
@@ -491,15 +1150,134 @@ class _ResultsPage extends StatelessWidget {
         ),
         const SizedBox(height: 7),
         Text(
-          showResult
+          ocrResult != null
+              ? 'Vehicle number OCR demo from your ESP32-CAM.'
+              : showResult
               ? 'One simulated review item was created from your selected video.'
               : 'Your completed analyses and live-camera alerts will appear here.',
         ),
         const SizedBox(height: 24),
-        if (showResult) const _ViolationEvidence() else const _EmptyResults(),
+        if (ocrResult != null)
+          _PlateOcrEvidence(result: ocrResult!, onRetry: onRetryOcr)
+        else if (showResult)
+          const _ViolationEvidence()
+        else
+          const _EmptyResults(),
       ],
     ),
   );
+}
+
+class _PlateOcrEvidence extends StatelessWidget {
+  const _PlateOcrEvidence({required this.result, this.onRetry});
+  final PlateOcrResult result;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final candidates = result.candidates;
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Vehicle number · OCR demo',
+            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
+          ),
+          const SizedBox(height: 14),
+          SelectableText(
+            candidates.isNotEmpty
+                ? candidates.join(' / ')
+                : result.rawText.isEmpty
+                ? 'No text detected'
+                : 'Text detected — check the reading below',
+            style: const TextStyle(
+              fontSize: 27,
+              fontWeight: FontWeight.w800,
+              color: Color(0xFF2155D9),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: result.parkingZone != null
+                  ? const Color(0xFFFFF4CE)
+                  : result.noParkingViolation
+                  ? const Color(0xFFFFE8E7)
+                  : const Color(0xFFE6F8EE),
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: Text(
+              result.parkingPosition != null
+                  ? (result.noParkingViolation
+                        ? 'INSIDE BAY - Fine Rs ${result.fineAmount}'
+                        : 'OUTSIDE BAY - NO FINE')
+                  : result.parkingZone != null
+                  ? 'Plate observed in no-parking bay - review required'
+                  : result.noParkingViolation
+                  ? 'NO PARKING VIOLATION · Fine Rs ${result.fineAmount}'
+                  : result.redZoneDetected
+                  ? 'NORMAL PARKING · No fine'
+                  : 'Parking status not confirmed',
+              style: TextStyle(
+                color: result.parkingZone != null
+                    ? const Color(0xFF795500)
+                    : result.noParkingViolation
+                    ? const Color(0xFFB42318)
+                    : const Color(0xFF16834A),
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            result.rawText.isEmpty
+                ? 'Move the page closer, use good lighting and keep the letters upright. Then try again.'
+                : 'Image-analyzer demo decision. Verify the image; this does not issue a legal fine or verify registration.',
+          ),
+          const SizedBox(height: 18),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(12),
+            child: Image.memory(
+              result.frame.jpeg,
+              fit: BoxFit.contain,
+              width: double.infinity,
+              height: 260,
+            ),
+          ),
+          const SizedBox(height: 14),
+          const Text(
+            'Recognized text',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
+          const SizedBox(height: 6),
+          SelectableText(
+            result.rawText.isEmpty
+                ? 'No readable text in this frame.'
+                : result.rawText,
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Captured: ${result.frame.capturedAt.toLocal().toString().split('.').first}',
+            style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'OCR: ${result.provider}',
+            style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+          ),
+          const SizedBox(height: 18),
+          FilledButton.icon(
+            onPressed: onRetry,
+            icon: const Icon(Icons.camera_alt_outlined),
+            label: const Text('Scan another number'),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _ViolationEvidence extends StatelessWidget {
@@ -683,6 +1461,7 @@ class _ViolationEvidence extends StatelessWidget {
             _Detail(label: 'Time in zone', value: '01:43'),
             _Detail(label: 'Plate OCR', value: 'Needs review'),
             _Detail(label: 'Confidence', value: '94%'),
+            _Detail(label: 'Demo fine', value: 'Rs 500'),
           ],
         ),
         const SizedBox(height: 18),
@@ -865,9 +1644,49 @@ class _VehicleCard extends StatelessWidget {
 }
 
 class _CamerasPage extends StatelessWidget {
-  const _CamerasPage({required this.controller, required this.onTest});
+  const _CamerasPage({
+    super.key,
+    required this.controller,
+    required this.streamUrl,
+    required this.discovering,
+    required this.onConnect,
+    required this.onDisconnect,
+    required this.onDiscover,
+    required this.updatingWifi,
+    required this.onConfigureWifi,
+    required this.onFrame,
+    required this.cameraReady,
+    required this.readingPlate,
+    required this.scanStatus,
+    required this.onReadPlate,
+    required this.autoScanning,
+    required this.onAutoScanningChanged,
+    required this.lastPlate,
+    required this.lcdStatus,
+    required this.archiveStatus,
+    required this.zone,
+    required this.onMarkZone,
+  });
   final TextEditingController controller;
-  final VoidCallback onTest;
+  final String? streamUrl;
+  final bool discovering;
+  final VoidCallback onConnect;
+  final VoidCallback onDisconnect;
+  final VoidCallback onDiscover;
+  final bool updatingWifi;
+  final VoidCallback onConfigureWifi;
+  final ValueChanged<List<int>> onFrame;
+  final bool cameraReady;
+  final bool readingPlate;
+  final String scanStatus;
+  final VoidCallback onReadPlate;
+  final bool autoScanning;
+  final ValueChanged<bool> onAutoScanningChanged;
+  final String? lastPlate;
+  final String lcdStatus;
+  final String archiveStatus;
+  final ParkingZone? zone;
+  final VoidCallback onMarkZone;
   @override
   Widget build(BuildContext context) => _Page(
     child: ListView(
@@ -878,13 +1697,278 @@ class _CamerasPage extends StatelessWidget {
         ),
         const SizedBox(height: 7),
         const Text(
-          'Add an RTSP-compatible IP camera to begin live monitoring.',
+          'Connect an ESP32-CAM to watch its live MJPEG feed in ParkGuard.',
         ),
-        const SizedBox(height: 24),
-        _RtspCard(controller: controller, onTest: onTest),
+        const SizedBox(height: 16),
+        OutlinedButton.icon(
+          onPressed: cameraReady ? onMarkZone : null,
+          icon: const Icon(Icons.crop_free),
+          label: Text(
+            zone == null ? 'Mark no-parking bay' : 'Redraw no-parking bay',
+          ),
+        ),
+        Text(
+          zone == null
+              ? 'Mark all 4 corners once. Scanning waits until the bay is saved.'
+              : 'Vehicle overlaps bay: fine. Completely outside: no fine. Redraw if the camera moves.',
+        ),
+        SwitchListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Automatic image analysis'),
+          subtitle: const Text(
+            'Checks on movement and every 30 seconds, even when still. Live video continues.',
+          ),
+          value: autoScanning,
+          onChanged: onAutoScanningChanged,
+        ),
+        // Keep the camera panel's list index stable when the first result arrives.
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (lastPlate != null) ...[
+              Text(
+                'Last confirmed: $lastPlate',
+                style: const TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+              Text(lcdStatus),
+              Text(archiveStatus),
+              const SizedBox(height: 10),
+            ],
+          ],
+        ),
+        Text(
+          cameraReady
+              ? '$scanStatus. Only confirmed numbers are sent to Results and the LCD.'
+              : 'Waiting for the live camera. Connect it below before scanning.',
+        ),
+        const SizedBox(height: 10),
+        FilledButton.icon(
+          onPressed: cameraReady && zone != null && !readingPlate
+              ? onReadPlate
+              : null,
+          icon: const Icon(Icons.document_scanner_outlined),
+          label: Text(
+            readingPlate ? 'Analyzing image...' : 'Analyze vehicle image',
+          ),
+        ),
+        const SizedBox(height: 20),
+        _RtspCard(
+          onFrame: onFrame,
+          zone: zone,
+          controller: controller,
+          streamUrl: streamUrl,
+          discovering: discovering,
+          onConnect: onConnect,
+          onDisconnect: onDisconnect,
+          onDiscover: onDiscover,
+          updatingWifi: updatingWifi,
+          onConfigureWifi: onConfigureWifi,
+        ),
       ],
     ),
   );
+}
+
+class _WifiCredentials {
+  const _WifiCredentials(this.ssid, this.password);
+
+  final String ssid;
+  final String password;
+}
+
+class _WifiCredentialsDialog extends StatefulWidget {
+  const _WifiCredentialsDialog();
+
+  @override
+  State<_WifiCredentialsDialog> createState() => _WifiCredentialsDialogState();
+}
+
+class _WifiCredentialsDialogState extends State<_WifiCredentialsDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _ssidController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _showPassword = false;
+
+  @override
+  void dispose() {
+    _ssidController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.pop(
+      context,
+      _WifiCredentials(_ssidController.text.trim(), _passwordController.text),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Change camera Wi-Fi'),
+    content: Form(
+      key: _formKey,
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Enter the network the ESP32-CAM should use. The camera will restart after saving.',
+            ),
+            const SizedBox(height: 18),
+            TextFormField(
+              controller: _ssidController,
+              autofocus: true,
+              maxLength: 32,
+              decoration: const InputDecoration(
+                labelText: 'Wi-Fi name (SSID)',
+                prefixIcon: Icon(Icons.wifi),
+                border: OutlineInputBorder(),
+              ),
+              validator: (value) => value == null || value.trim().isEmpty
+                  ? 'Enter the Wi-Fi name.'
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            TextFormField(
+              controller: _passwordController,
+              obscureText: !_showPassword,
+              maxLength: 63,
+              decoration: InputDecoration(
+                labelText: 'Wi-Fi password',
+                helperText:
+                    'Use 8-63 characters, or leave empty for open Wi-Fi.',
+                prefixIcon: const Icon(Icons.lock_outline),
+                suffixIcon: IconButton(
+                  onPressed: () =>
+                      setState(() => _showPassword = !_showPassword),
+                  icon: Icon(
+                    _showPassword ? Icons.visibility_off : Icons.visibility,
+                  ),
+                ),
+                border: const OutlineInputBorder(),
+              ),
+              validator: (value) =>
+                  value != null && value.isNotEmpty && value.length < 8
+                  ? 'Password must contain at least 8 characters.'
+                  : null,
+              onFieldSubmitted: (_) => _save(),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'If connection fails, join ParkGuard-Setup (password: parkguard123) and use 192.168.4.1 to recover.',
+              style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            ),
+          ],
+        ),
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(onPressed: _save, child: const Text('Save and restart')),
+    ],
+  );
+}
+
+class _LiveBadge extends StatelessWidget {
+  const _LiveBadge();
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+    decoration: BoxDecoration(
+      color: const Color(0xFFD92D20),
+      borderRadius: BorderRadius.circular(5),
+    ),
+    child: const Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.circle, color: Colors.white, size: 8),
+        SizedBox(width: 5),
+        Text(
+          'LIVE',
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 11,
+            fontWeight: FontWeight.w800,
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class _LiveCameraView extends StatefulWidget {
+  const _LiveCameraView({
+    super.key,
+    required this.streamUrl,
+    this.onFrame,
+    this.zone,
+  });
+
+  final String streamUrl;
+  final ValueChanged<List<int>>? onFrame;
+  final ParkingZone? zone;
+
+  @override
+  State<_LiveCameraView> createState() => _LiveCameraViewState();
+}
+
+class _LiveCameraViewState extends State<_LiveCameraView>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        LiveCameraStream(
+          url: widget.streamUrl,
+          onFrame: (frame) => widget.onFrame?.call(frame),
+          onUnavailable: () => widget.onFrame?.call(const []),
+        ),
+        if (widget.zone case final zone?)
+          IgnorePointer(
+            child: CustomPaint(
+              painter: ParkingZonePainter(zone.points, zone.aspectRatio),
+            ),
+          ),
+        const Positioned(top: 10, left: 10, child: _LiveBadge()),
+        Positioned(
+          top: 10,
+          right: 10,
+          child: Container(
+            constraints: const BoxConstraints(maxWidth: 190),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: .68),
+              borderRadius: BorderRadius.circular(5),
+            ),
+            child: Text(
+              'Image analyzer',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }
 
 class _SideRail extends StatelessWidget {
@@ -967,28 +2051,34 @@ class _LogoMark extends StatelessWidget {
 }
 
 class _OnlineBadge extends StatelessWidget {
-  const _OnlineBadge();
+  const _OnlineBadge({this.compact = false});
+  final bool compact;
   @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
-    decoration: BoxDecoration(
-      color: const Color(0xFFE6F8EE),
-      borderRadius: BorderRadius.circular(14),
-    ),
-    child: const Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(Icons.circle, size: 8, color: Color(0xFF16834A)),
-        SizedBox(width: 5),
-        Text(
-          'System online',
-          style: TextStyle(
-            fontSize: 11,
-            color: Color(0xFF16834A),
-            fontWeight: FontWeight.w700,
-          ),
-        ),
-      ],
+  Widget build(BuildContext context) => Tooltip(
+    message: 'System online',
+    child: Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFFE6F8EE),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.circle, size: 8, color: Color(0xFF16834A)),
+          if (!compact) ...[
+            const SizedBox(width: 5),
+            const Text(
+              'System online',
+              style: TextStyle(
+                fontSize: 11,
+                color: Color(0xFF16834A),
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
+        ],
+      ),
     ),
   );
 }
@@ -1024,18 +2114,20 @@ class _PanelTitle extends StatelessWidget {
         child: Icon(icon, color: const Color(0xFF2155D9)),
       ),
       const SizedBox(width: 11),
-      Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 17),
-          ),
-          Text(
-            subtitle,
-            style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
-          ),
-        ],
+      Expanded(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              title,
+              style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 17),
+            ),
+            Text(
+              subtitle,
+              style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+            ),
+          ],
+        ),
       ),
     ],
   );

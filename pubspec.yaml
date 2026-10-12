@@ -34,8 +34,15 @@ dependencies:
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
+  flutter_mjpeg:
+    path: third_party/flutter_mjpeg
+  multicast_dns: ^0.3.3+1
+  http: 0.13.6
+  tflite_flutter: 0.12.1
+  image: 4.5.4
 
 dev_dependencies:
+  visibility_detector: ^0.4.0+2
   flutter_test:
     sdk: flutter
 
@@ -57,6 +64,7 @@ flutter:
   # the material Icons class.
   uses-material-design: true
   assets:
+    - assets/models/vehicle_detector.tflite
     - .test_frames/frame_150s.jpg
     - .test_frames/vehicles/utility_truck.jpg
     - .test_frames/vehicles/red_pickup.jpg

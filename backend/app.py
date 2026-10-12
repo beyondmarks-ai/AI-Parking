@@ -1,14 +1,24 @@
 import os
+import re
 from contextlib import asynccontextmanager
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from foundry_ocr import router as foundry_router
+from capture_archive import router as capture_router
+from parking_analyzer import router as parking_router
 
 DATABASE_URL = os.environ['DATABASE_URL']
+AZURE_VISION_ENDPOINT = os.getenv('AZURE_VISION_ENDPOINT', '').rstrip('/')
+AZURE_VISION_KEY = os.getenv('AZURE_VISION_KEY', '')
+MAX_OCR_IMAGE_BYTES = 4 * 1024 * 1024
 SCHEMA = (Path(__file__).parent / 'schema.sql').read_text(encoding='utf-8')
 
 
@@ -34,7 +44,144 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='ParkGuard AI API', version='1.0.0', lifespan=lifespan)
+app.include_router(foundry_router)
+app.include_router(capture_router)
+app.include_router(parking_router)
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS', '*').split(','), allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
+
+
+def plate_candidates(lines: list[str]) -> list[str]:
+    """Extract review candidates without guessing ambiguous characters."""
+    pattern = re.compile(r'^(?:[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}|\d{2}BH\d{4}[A-Z]{1,2})$')
+    normalized = [line.upper().strip() for line in lines if line.strip()]
+    matches: list[str] = []
+    for index in range(len(normalized)):
+        for count in (1, 2):
+            value = ''.join(normalized[index:index + count])
+            value = re.sub(r'[\s-]', '', value)
+            if pattern.fullmatch(value) and value not in matches:
+                matches.append(value)
+    return matches
+
+
+def find_red_restricted_zone(image_bytes: bytes) -> dict[str, float] | None:
+    """Locate the largest connected red marking, independent of camera pose."""
+    try:
+        with Image.open(BytesIO(image_bytes)) as source:
+            image = source.convert('RGB')
+    except (UnidentifiedImageError, OSError):
+        return None
+
+    image.thumbnail((360, 360))
+    width, height = image.size
+    pixels = image.load()
+    red = bytearray(width * height)
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixels[x, y]
+            if r >= 90 and r - g >= 28 and r - b >= 22 and r >= g * 1.22:
+                red[y * width + x] = 1
+
+    visited = bytearray(width * height)
+    components: list[tuple[int, int, int, int, int]] = []
+    for start in range(width * height):
+        if not red[start] or visited[start]:
+            continue
+        stack = [start]
+        visited[start] = 1
+        count = 0
+        min_x = max_x = start % width
+        min_y = max_y = start // width
+        while stack:
+            current = stack.pop()
+            x, y = current % width, current // width
+            count += 1
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < width and 0 <= ny < height:
+                        neighbor = ny * width + nx
+                        if red[neighbor] and not visited[neighbor]:
+                            visited[neighbor] = 1
+                            stack.append(neighbor)
+        box_width, box_height = max_x - min_x + 1, max_y - min_y + 1
+        if (
+            count < max(35, width * height // 5000)
+            or (box_width < width * .08 and box_height < height * .08)
+            # Ignore cables, LEDs, or furniture entering from a frame edge.
+            or min_x <= width * .01
+            or min_y <= height * .01
+            or max_x >= width * .99
+            or max_y >= height * .99
+        ):
+            continue
+        candidate = (count, min_x, min_y, max_x, max_y)
+        components.append(candidate)
+
+    if not components:
+        return None
+    _, min_x, min_y, max_x, max_y = max(components, key=lambda item: item[0])
+    # A parked vehicle can hide the diagonal that joins the stripes. Merge
+    # nearby fragments so the inferred restricted rectangle does not shrink.
+    changed = True
+    merged: set[int] = set()
+    while changed:
+        changed = False
+        for index, (_, other_left, other_top, other_right, other_bottom) in enumerate(components):
+            if index in merged:
+                continue
+            gap_x = max(other_left - max_x, min_x - other_right, 0)
+            gap_y = max(other_top - max_y, min_y - other_bottom, 0)
+            if gap_x <= width * .12 and gap_y <= height * .12:
+                min_x, min_y = min(min_x, other_left), min(min_y, other_top)
+                max_x, max_y = max(max_x, other_right), max(max_y, other_bottom)
+                merged.add(index)
+                changed = True
+    padding_x, padding_y = width * .015, height * .015
+    return {
+        'left': max(0.0, (min_x - padding_x) / width),
+        'top': max(0.0, (min_y - padding_y) / height),
+        'right': min(1.0, (max_x + padding_x) / width),
+        'bottom': min(1.0, (max_y + padding_y) / height),
+    }
+
+
+def candidate_details(
+    azure_lines: list[dict], red_zone: dict[str, float] | None, width: int, height: int
+) -> list[dict]:
+    texts = [line.get('text', '').upper().strip() for line in azure_lines]
+    pattern = re.compile(r'^(?:[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}|\d{2}BH\d{4}[A-Z]{1,2})$')
+    details: list[dict] = []
+    for index in range(len(texts)):
+        for count in (1, 2):
+            selected = azure_lines[index:index + count]
+            value = re.sub(r'[\s-]', '', ''.join(texts[index:index + count]))
+            if not pattern.fullmatch(value) or any(item['plate'] == value for item in details):
+                continue
+            points = [
+                point
+                for line in selected
+                for point in line.get('boundingPolygon', [])
+                if 'x' in point and 'y' in point
+            ]
+            center = None
+            restricted = False
+            if points and width > 0 and height > 0:
+                center = {
+                    'x': sum(point['x'] for point in points) / len(points) / width,
+                    'y': sum(point['y'] for point in points) / len(points) / height,
+                }
+                if red_zone is not None:
+                    restricted = (
+                        red_zone['left'] <= center['x'] <= red_zone['right']
+                        and red_zone['top'] <= center['y'] <= red_zone['bottom']
+                    )
+            details.append({'plate': value, 'center': center, 'restricted': restricted})
+    return details
 
 
 @app.get('/health')
@@ -42,6 +189,71 @@ async def health():
     async with app.state.db.acquire() as connection:
         await connection.fetchval('select 1')
     return {'status': 'healthy'}
+
+
+@app.post('/api/v1/ocr/plate')
+async def recognize_plate(request: Request):
+    if not AZURE_VISION_ENDPOINT or not AZURE_VISION_KEY:
+        raise HTTPException(status_code=503, detail='Azure Vision is not configured')
+
+    content_type = request.headers.get('content-type', '').split(';', 1)[0].lower()
+    if content_type not in {'image/jpeg', 'image/png', 'application/octet-stream'}:
+        raise HTTPException(status_code=415, detail='Send a JPEG or PNG image')
+    content_length = request.headers.get('content-length')
+    if content_length and int(content_length) > MAX_OCR_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail='Image exceeds the 4 MB limit')
+
+    image = await request.body()
+    is_jpeg = image.startswith(b'\xff\xd8')
+    is_png = image.startswith(b'\x89PNG\r\n\x1a\n')
+    if not image or len(image) > MAX_OCR_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail='Image is empty or exceeds the 4 MB limit')
+    if not (is_jpeg or is_png):
+        raise HTTPException(status_code=415, detail='Invalid JPEG or PNG image')
+
+    url = f'{AZURE_VISION_ENDPOINT}/computervision/imageanalysis:analyze'
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            response = await client.post(
+                url,
+                params={'api-version': '2024-02-01', 'features': 'read'},
+                headers={
+                    'Ocp-Apim-Subscription-Key': AZURE_VISION_KEY,
+                    'Content-Type': 'application/octet-stream',
+                },
+                content=image,
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail='Azure Vision OCR failed') from error
+
+    payload = response.json()
+    azure_lines = [
+        line
+        for block in payload.get('readResult', {}).get('blocks', [])
+        for line in block.get('lines', [])
+        if line.get('text', '').strip()
+    ]
+    lines = [line.get('text', '').strip() for line in azure_lines]
+    metadata = payload.get('metadata', {})
+    red_zone = find_red_restricted_zone(image)
+    details = candidate_details(
+        azure_lines,
+        red_zone,
+        int(metadata.get('width', 0)),
+        int(metadata.get('height', 0)),
+    )
+    violation = any(item['restricted'] for item in details)
+    return {
+        'provider': 'azure-ai-vision',
+        'text': '\n'.join(lines),
+        'lines': lines,
+        'candidates': plate_candidates(lines),
+        'candidate_details': details,
+        'red_zone': red_zone,
+        'no_parking_violation': violation,
+        'fine_amount': 500 if violation else 0,
+    }
 
 
 @app.get('/api/v1/dashboard')

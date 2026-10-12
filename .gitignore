@@ -46,3 +46,18 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Local builds, camera evidence, device backups and temporary work.
+/output/
+/tmp/
+*.apk
+*.aab
+
+# Credentials and local Python environments must never be published.
+**/.env
+**/.env.*
+!**/.env.example
+**/.venv/
+**/__pycache__/
+*.jks
+*.keystore

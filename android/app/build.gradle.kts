@@ -34,6 +34,11 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            // R8 breaks ML Kit's component injection on the prototype device,
+            // causing TextRecognition.getClient() to dereference a stripped
+            // provider. Keep native OCR intact for the release demonstration.
+            isMinifyEnabled = false
+            isShrinkResources = false
         }
     }
 }
@@ -46,4 +51,9 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    // Bundle Latin OCR so the camera demo does not need a model download.
+    implementation("com.google.mlkit:text-recognition:16.0.1")
 }
