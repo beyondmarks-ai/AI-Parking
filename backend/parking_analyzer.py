@@ -7,6 +7,8 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone, timedelta
+import hashlib
 from urllib.parse import quote
 
 import httpx
@@ -15,6 +17,7 @@ from PIL import Image, ImageDraw, UnidentifiedImageError
 
 from capture_archive import validate_zone
 from foundry_ocr import PLATE, MAX_BYTES
+from account_portal import record_observation
 
 router = APIRouter()
 _slots = asyncio.Semaphore(2)
@@ -117,6 +120,18 @@ async def analyze(data: bytes, zone: dict, client: httpx.AsyncClient):
 
 @router.post('/api/v1/parking/analyze')
 async def analyze_parking(request: Request, x_parking_zone: str = Header(max_length=2048)):
+    camera_key, captured = None, None
+    if hasattr(request.app.state, 'db'):
+        camera = request.headers.get('x-camera-source', '').strip()
+        if not camera or len(camera) > 256:
+            raise HTTPException(422, 'Camera source is required')
+        try:
+            captured = datetime.fromisoformat(request.headers.get('x-frame-time', ''))
+        except ValueError as error:
+            raise HTTPException(422, 'Invalid frame time') from error
+        if captured.tzinfo is None or not datetime.now(timezone.utc)-timedelta(minutes=2) <= captured <= datetime.now(timezone.utc)+timedelta(minutes=1):
+            raise HTTPException(422, 'Invalid frame time')
+        camera_key = hashlib.sha256(camera.encode()).hexdigest()
     if request.headers.get('content-type', '').split(';')[0].lower() != 'image/jpeg':
         raise HTTPException(415, 'Send a JPEG image')
     data = bytearray()
@@ -140,6 +155,9 @@ async def analyze_parking(request: Request, x_parking_zone: str = Header(max_len
     _requests.append(now)
     try:
         async with _slots, httpx.AsyncClient(timeout=20) as client:
-            return await analyze(bytes(data), zone, client)
+            result = await analyze(bytes(data), zone, client)
+        if hasattr(request.app.state, 'db'):
+            result['penalty_id'] = await record_observation(request.app.state.db, camera_key, captured, result, bytes(data))
+        return result
     except (httpx.HTTPError, ValueError, TypeError, KeyError) as error:
         raise HTTPException(502, 'Image analysis unavailable') from error

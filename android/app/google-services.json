@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "546926884574",
+    "project_id": "guardian-ai-617db5",
+    "storage_bucket": "guardian-ai-617db5.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:546926884574:android:f3505fc0a0333ec8cb344f",
+        "android_client_info": {
+          "package_name": "com.aiparking.parking_violation_app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDj50M6kVTlP0GqJYrvar281DR9HLILt_Y"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

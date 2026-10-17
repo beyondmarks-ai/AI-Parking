@@ -34,6 +34,13 @@ outside updates to `NO FINE`. Firmware `Esp32LcdHello` prints only the plate on
 row 1 and `Fine Rs <amount>` or `NO FINE` on row 2. Startup no longer displays a
 fake plate. Camera HTTP acceptance still does not prove a physical LCD update.
 
+Confirmed inside-bay violations also play a short buzzer on the Android phone,
+using media volume. This happens independently of LCD delivery. The same plate
+does not buzz again until it is observed outside, the scene is confirmed empty,
+or the camera/bay is reloaded. Uncertain and outside observations stay silent.
+The alert follows the existing image-analysis timing and requires a confirmed
+plate and bay position; it is not an instantaneous motion alarm.
+
 Original snapshots retain bay, plate and fine metadata in private Azure storage.
 The optional archive headers are `X-Parking-Decision` (`inside`/`outside`) and
 `X-Fine-Amount`; inconsistent pairs are rejected. Records carry

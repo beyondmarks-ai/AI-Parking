@@ -1,5 +1,7 @@
 import os
 import re
+import asyncio
+from contextlib import suppress
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -9,11 +11,14 @@ import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from foundry_ocr import router as foundry_router
 from capture_archive import router as capture_router
 from parking_analyzer import router as parking_router
+from account_portal import router as account_router, current_user, require_admin
+from push_notifications import initialize_push, push_worker
 
 DATABASE_URL = os.environ['DATABASE_URL']
 AZURE_VISION_ENDPOINT = os.getenv('AZURE_VISION_ENDPOINT', '').rstrip('/')
@@ -39,15 +44,49 @@ async def lifespan(app: FastAPI):
     async with app.state.db.acquire() as connection:
         await connection.execute('create extension if not exists pgcrypto;')
         await connection.execute(SCHEMA)
-    yield
-    await app.state.db.close()
+        admin_email = os.getenv('BOOTSTRAP_ADMIN_EMAIL', '').strip().lower()
+        admin_hash = os.getenv('BOOTSTRAP_ADMIN_HASH', '')
+        if admin_email and admin_hash:
+            await connection.execute('''insert into portal_users(name,email,password_hash,role)
+                values('Administrator',$1,$2,'admin') on conflict(email) do nothing''', admin_email, admin_hash)
+    push = initialize_push()
+    worker = asyncio.create_task(push_worker(app.state.db, push)) if push else None
+    try:
+        yield
+    finally:
+        if worker:
+            worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker
+        await app.state.db.close()
 
 
 app = FastAPI(title='ParkGuard AI API', version='1.0.0', lifespan=lifespan)
 app.include_router(foundry_router)
 app.include_router(capture_router)
 app.include_router(parking_router)
+app.include_router(account_router)
 app.add_middleware(CORSMiddleware, allow_origins=os.getenv('CORS_ORIGINS', '*').split(','), allow_credentials=False, allow_methods=['*'], allow_headers=['*'])
+
+
+@app.middleware('http')
+async def protect_api(request: Request, call_next):
+    path = request.url.path
+    try:
+        if path.startswith('/api/v1/') and request.method != 'OPTIONS':
+            if path in ('/api/v1/auth/signup', '/api/v1/auth/login'):
+                if len(await request.body()) > 8192:
+                    raise HTTPException(413, 'Account request too large')
+            else:
+                await current_user(request)
+                if not path.startswith(('/api/v1/account', '/api/v1/auth/logout', '/api/v1/penalties', '/api/v1/push')):
+                    await require_admin(request)
+        response = await call_next(request)
+        if path.startswith('/api/v1/'):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
+    except HTTPException as error:
+        return JSONResponse({'detail': error.detail}, status_code=error.status_code, headers=error.headers)
 
 
 def plate_candidates(lines: list[str]) -> list[str]:

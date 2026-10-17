@@ -18,7 +18,9 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
-      await tester.pumpWidget(const ParkGuardApp(autoDiscoverCamera: false));
+      await tester.pumpWidget(
+        const MaterialApp(home: OperatorHome(autoDiscoverCamera: false)),
+      );
       expect(tester.takeException(), isNull);
       await tester.tap(find.text('Cameras'));
       await tester.pumpAndSettle();
@@ -33,7 +35,9 @@ void main() {
   }
 
   testWidgets('analysis workspace renders', (WidgetTester tester) async {
-    await tester.pumpWidget(const ParkGuardApp(autoDiscoverCamera: false));
+    await tester.pumpWidget(
+      const MaterialApp(home: OperatorHome(autoDiscoverCamera: false)),
+    );
     expect(find.text('Analyse parking activity'), findsOneWidget);
     expect(find.text('Start analysis'), findsOneWidget);
   });
@@ -41,17 +45,26 @@ void main() {
   testWidgets('camera page includes Wi-Fi configuration', (
     WidgetTester tester,
   ) async {
-    await tester.pumpWidget(const ParkGuardApp(autoDiscoverCamera: false));
+    await tester.pumpWidget(
+      const MaterialApp(home: OperatorHome(autoDiscoverCamera: false)),
+    );
     await tester.tap(find.text('Cameras'));
     await tester.pump();
 
+    await tester.scrollUntilVisible(
+      find.text('Change camera Wi-Fi'),
+      180,
+      scrollable: find.byType(Scrollable).last,
+    );
     expect(find.text('Change camera Wi-Fi'), findsOneWidget);
   });
 
   testWidgets(
     'automatic scanning defaults on and pause survives tab switches',
     (tester) async {
-      await tester.pumpWidget(const ParkGuardApp(autoDiscoverCamera: false));
+      await tester.pumpWidget(
+        const MaterialApp(home: OperatorHome(autoDiscoverCamera: false)),
+      );
       await tester.tap(find.text('Cameras'));
       await tester.pumpAndSettle();
       expect(
@@ -83,7 +96,9 @@ void main() {
       tester.view.devicePixelRatio = 1;
       addTearDown(tester.view.resetPhysicalSize);
       addTearDown(tester.view.resetDevicePixelRatio);
-      await tester.pumpWidget(const ParkGuardApp(autoDiscoverCamera: false));
+      await tester.pumpWidget(
+        const MaterialApp(home: OperatorHome(autoDiscoverCamera: false)),
+      );
       await tester.tap(find.text('Cameras'));
       await tester.pump();
       await tester.enterText(find.byType(TextField), 'http://camera:81/stream');

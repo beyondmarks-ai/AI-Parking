@@ -6,6 +6,7 @@ import 'dart:math';
 import 'package:http/http.dart' as http;
 
 import 'plate_ocr.dart';
+import 'account_session.dart';
 
 class PlateSnapshot {
   PlateSnapshot(this.result) : id = _newId() {
@@ -85,6 +86,7 @@ class SnapshotArchive {
             .put(
               Uri.parse('$_baseUrl/api/v1/captures/${snapshot.id}'),
               headers: {
+                ...AccountSession.headers,
                 'Content-Type': 'image/jpeg',
                 'X-Plate-Number': snapshot.plate,
                 'X-Captured-At': snapshot.result.frame.capturedAt

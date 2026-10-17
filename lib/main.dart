@@ -4,6 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'camera_discovery.dart';
+import 'account_portal.dart';
+import 'account_session.dart';
+import 'bay_buzzer.dart';
 import 'camera_wifi_config.dart';
 import 'live_camera_stream.dart';
 import 'motion_trigger.dart';
@@ -34,14 +37,24 @@ class ParkGuardApp extends StatelessWidget {
         brightness: Brightness.light,
       ),
     ),
-    home: OperatorHome(autoDiscoverCamera: autoDiscoverCamera),
+    home: AccountGate(
+      adminBuilder: (signOut) => OperatorHome(
+        autoDiscoverCamera: autoDiscoverCamera,
+        onSignOut: signOut,
+      ),
+    ),
   );
 }
 
 class OperatorHome extends StatefulWidget {
-  const OperatorHome({super.key, this.autoDiscoverCamera = true});
+  const OperatorHome({
+    super.key,
+    this.autoDiscoverCamera = true,
+    this.onSignOut,
+  });
 
   final bool autoDiscoverCamera;
+  final VoidCallback? onSignOut;
   @override
   State<OperatorHome> createState() => _OperatorHomeState();
 }
@@ -62,6 +75,7 @@ class _OperatorHomeState extends State<OperatorHome> {
   String _scanStatus = 'Live — watching for movement';
   bool _autoScanning = true;
   var _scanPolicy = ImageScanPolicy();
+  final _bayBuzzer = BayBuzzer();
   String _lcdStatus = 'Waiting for a confirmed number';
   final _snapshotArchive = SnapshotArchive();
   PlateSnapshot? _archiveSnapshot;
@@ -82,6 +96,7 @@ class _OperatorHomeState extends State<OperatorHome> {
   int _zoneLoadId = 0;
 
   Future<void> _loadParkingZone(String camera) async {
+    _bayBuzzer.reset();
     final id = ++_zoneLoadId;
     setState(() {
       _parkingZone = null;
@@ -122,6 +137,7 @@ class _OperatorHomeState extends State<OperatorHome> {
           _parkingZone = zone;
           // A new calibration starts a new archive/alert encounter.
           _scanPolicy = ImageScanPolicy();
+          _bayBuzzer.reset();
           _archiveKey = null;
         });
         _showMessage('Whole bay saved. No red strips needed.');
@@ -345,8 +361,10 @@ class _OperatorHomeState extends State<OperatorHome> {
         burst,
         zone: zone,
         isActive: active,
+        cameraSource: Uri.parse(streamUrl).host,
       );
       if (!active()) return;
+      unawaited(_buzzForObservation(observation));
       final result = observation.result;
       if (result == null) {
         if (observation.status == 'empty') _scanPolicy.observeEmpty();
@@ -426,6 +444,14 @@ class _OperatorHomeState extends State<OperatorHome> {
         _scanPolicy.completed(DateTime.now(), failed: failed);
         setState(() => _readingPlate = false);
       }
+    }
+  }
+
+  Future<void> _buzzForObservation(ImageParkingObservation observation) async {
+    try {
+      await _bayBuzzer.observe(observation);
+    } on Object {
+      if (mounted) _showMessage('Could not play the bay alert sound.');
     }
   }
 
@@ -659,6 +685,23 @@ class _OperatorHomeState extends State<OperatorHome> {
           ],
         ),
         actions: [
+          if (AccountSession.current?.isAdmin ?? false)
+            IconButton(
+              tooltip: 'Accounts & penalties',
+              icon: const Icon(Icons.dashboard_outlined),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => const AccountDashboard(admin: true),
+                ),
+              ),
+            ),
+          if (widget.onSignOut != null)
+            IconButton(
+              tooltip: 'Sign out',
+              icon: const Icon(Icons.logout),
+              onPressed: widget.onSignOut,
+            ),
           _OnlineBadge(compact: MediaQuery.sizeOf(context).width < 420),
           const SizedBox(width: 12),
           const CircleAvatar(
@@ -1716,7 +1759,7 @@ class _CamerasPage extends StatelessWidget {
           contentPadding: EdgeInsets.zero,
           title: const Text('Automatic image analysis'),
           subtitle: const Text(
-            'Checks on movement and every 30 seconds, even when still. Live video continues.',
+            'Checks on movement and every 30 seconds, even when still. Confirmed bay violations buzz on your phone; keep media volume on.',
           ),
           value: autoScanning,
           onChanged: onAutoScanningChanged,

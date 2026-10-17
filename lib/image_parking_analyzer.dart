@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'parking_zone.dart';
+import 'account_session.dart';
 import 'plate_burst.dart';
 import 'plate_ocr.dart';
 
@@ -28,6 +29,7 @@ class ImageParkingAnalyzer {
     List<CameraFrame> frames, {
     required ParkingZone zone,
     required bool Function() isActive,
+    String cameraSource = 'camera',
   }) async {
     if (_baseUrl.isEmpty) {
       throw StateError('Image analysis backend is not configured');
@@ -48,8 +50,11 @@ class ImageParkingAnalyzer {
         .post(
           Uri.parse('$_baseUrl/api/v1/parking/analyze'),
           headers: {
+            ...AccountSession.headers,
             'Content-Type': 'image/jpeg',
             'X-Parking-Zone': zone.encode(),
+            'X-Camera-Source': cameraSource,
+            'X-Frame-Time': frame.capturedAt.toUtc().toIso8601String(),
           },
           body: frame.jpeg,
         )

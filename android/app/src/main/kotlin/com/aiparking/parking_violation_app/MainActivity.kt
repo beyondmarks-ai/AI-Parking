@@ -1,10 +1,16 @@
 package com.aiparking.parking_violation_app
 
 import android.app.Activity
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import com.google.firebase.messaging.FirebaseMessaging
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
 import android.graphics.BitmapFactory
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.wifi.WifiManager
 import android.net.Uri
 import android.os.Bundle
@@ -27,6 +33,12 @@ class MainActivity : FlutterActivity() {
     private val textRecognizer
         get() = textRecognizerDelegate.value
     private var ocrBusy = false
+    private var bayBuzzer: ToneGenerator? = null
+
+    override fun onPause() {
+        bayBuzzer?.stopTone()
+        super.onPause()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -38,6 +50,8 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        bayBuzzer?.release()
+        bayBuzzer = null
         // Do not initialize ML Kit solely to close it during an early activity
         // recreation (for example, a rotation before the first OCR request).
         if (textRecognizerDelegate.isInitialized()) {
@@ -50,6 +64,50 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parkguard/account_session").setMethodCallHandler { call, result ->
+            try {
+                when (call.method) {
+                    "load" -> result.success(AccountStorage.load(this))
+                    "save" -> {
+                        AccountStorage.save(this, call.argument<String>("token")!!, call.argument<String>("userId")!!, call.argument<String>("api")!!)
+                        result.success(null)
+                    }
+                    "clear" -> { AccountStorage.clear(this); result.success(null) }
+                    "notification" -> {
+                        val penalty = intent.getStringExtra("penalty_id")
+                        intent.removeExtra("penalty_id")
+                        result.success(penalty)
+                    }
+                    "pushToken" -> {
+                        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7002)
+                        }
+                        FirebaseMessaging.getInstance().token.addOnSuccessListener { result.success(it) }
+                            .addOnFailureListener { result.error("PUSH_FAILED", "Could not register notifications", null) }
+                    }
+                    else -> result.notImplemented()
+                }
+            } catch (error: Exception) { result.error("SESSION_FAILED", error.message, null) }
+        }
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parkguard/bay_buzzer").setMethodCallHandler { call, result ->
+            if (call.method != "buzz") {
+                result.notImplemented()
+                return@setMethodCallHandler
+            }
+            try {
+                val tone = bayBuzzer ?: ToneGenerator(AudioManager.STREAM_MUSIC, 90).also {
+                    bayBuzzer = it
+                }
+                tone.stopTone()
+                if (tone.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 1200)) {
+                    result.success(null)
+                } else {
+                    result.error("BUZZER_FAILED", "Could not start the bay alert sound", null)
+                }
+            } catch (error: Exception) {
+                result.error("BUZZER_FAILED", error.message, null)
+            }
+        }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "parkguard/parking_zone").setMethodCallHandler { call, result ->
             val camera = call.argument<String>("camera")
             if (camera.isNullOrBlank() || camera.length > 2048) {
@@ -137,6 +195,11 @@ class MainActivity : FlutterActivity() {
                 type = "video/*"
             }, pickVideoRequest)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
