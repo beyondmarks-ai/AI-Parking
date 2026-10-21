@@ -70,3 +70,10 @@ local OCR run in the foreground Android app; uncertain OCR and private snapshot
 storage use the backend. Backgrounding the app pauses live scanning.
 
 # AI-Parking
+
+<!-- beyond-marks-credit:start -->
+---
+### Built by Beyond Marks AI Academy
+
+Developed by **Rakesh Kumar** at [Beyond Marks AI Academy](https://beyondmarks.ai).
+<!-- beyond-marks-credit:end -->
